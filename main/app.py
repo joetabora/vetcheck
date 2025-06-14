@@ -4,6 +4,7 @@ import json
 import os
 import logging
 import hashlib
+import re
 from flask import Flask, request, jsonify, send_from_directory
 from tenacity import retry, wait_exponential, stop_after_attempt
 
@@ -33,15 +34,57 @@ def create_prompt(user_data):
     species = user_data.get('species', '').lower()
     breed = user_data.get('breed', '')
     
-    prompt = f"You are an expert veterinary diagnostic AI specializing in {species} health. Provide a JSON response with ranked possible diagnoses, their likelihood (%), explanation, urgency (true/false), consultation advice, and home care suggestions based on this {species} patient data:\n"
+    prompt = f"""You are an expert veterinary diagnostic AI specializing in {species} health. 
+
+Based on the following {species} patient data, provide a JSON response with ranked possible diagnoses:
+
+"""
     
     for key, value in user_data.items():
         if value:  # Only include non-empty values
             prompt += f"{key.replace('_', ' ').capitalize()}: {value}\n"
     
     prompt += f"\nConsider breed-specific health predispositions for {breed if breed else 'mixed breed'} {species}."
-    prompt += "\nReturn JSON with fields: conditions (list of {name, likelihood, explanation}), urgent (bool), consult (str), homecare (str)."
+    
+    prompt += """
+
+Please respond with ONLY a valid JSON object in this exact format:
+{
+  "conditions": [
+    {
+      "name": "Condition Name",
+      "likelihood": 85,
+      "explanation": "Brief explanation of why this condition fits the symptoms"
+    }
+  ],
+  "urgent": true,
+  "consult": "Recommendation for veterinary consultation",
+  "homecare": "Home care suggestions"
+}
+
+Provide 1-3 conditions ranked by likelihood percentage. Make sure the JSON is valid and complete."""
+    
     return prompt
+
+def extract_json_from_response(text):
+    """Extract JSON from response text, handling cases where there might be extra text"""
+    text = text.strip()
+    
+    # Try to find JSON within the text
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group()
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+    
+    # If that fails, try parsing the entire response as JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from response: {text}")
+        return None
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
 def query_openrouter(prompt, use_cache=True):
@@ -57,16 +100,23 @@ def query_openrouter(prompt, use_cache=True):
         "HTTP-Referer": "http://localhost:5000",
         "X-Title": "Veterinary AI Assistant"
     }
+    
+    # Remove response_format for this model - it's causing the validation error
     data = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
         "temperature": 0.15,
         "max_tokens": 2000
     }
     
+    logger.info(f"Sending request to OpenRouter with model: {OPENROUTER_MODEL}")
+    
     response = requests.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=data)
-    response.raise_for_status()
+    
+    if response.status_code != 200:
+        logger.error(f"OpenRouter API error: {response.status_code} - {response.text}")
+        response.raise_for_status()
+    
     result = response.json()
     
     # Cache the response
@@ -80,12 +130,14 @@ def query_openrouter(prompt, use_cache=True):
     return result
 
 def process_response(response):
-    content = response["choices"][0]["message"]["content"]
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON: {content}")
+    if not response or "choices" not in response or not response["choices"]:
+        logger.error("Invalid response structure")
         return None
+        
+    content = response["choices"][0]["message"]["content"]
+    logger.info(f"Raw AI response: {content}")
+    
+    return extract_json_from_response(content)
 
 def get_diagnoses(response):
     if response and "conditions" in response:
@@ -135,19 +187,25 @@ def diagnose():
             return jsonify({"error": "Species must be either 'cat' or 'dog'"}), 400
         
         prompt = create_prompt(user_data)
+        logger.info(f"Generated prompt: {prompt}")
+        
         results = []
         queried_models = []
         skipped_models = []
+        openrouter_response = None
         
         if OPENROUTER_API_KEY:
             try:
-                openrouter_response = process_response(query_openrouter(prompt))
+                raw_response = query_openrouter(prompt)
+                openrouter_response = process_response(raw_response)
                 if openrouter_response:
                     openrouter_diagnoses = get_diagnoses(openrouter_response)
                     results.extend(openrouter_diagnoses)
                     queried_models.append("OpenRouter/Llama-3.3")
+                    logger.info(f"Successfully processed OpenRouter response: {openrouter_response}")
                 else:
                     skipped_models.append("OpenRouter (response parsing error)")
+                    logger.error("Failed to parse OpenRouter response")
             except Exception as e:
                 logger.error(f"OpenRouter API error: {str(e)}")
                 skipped_models.append(f"OpenRouter (API error: {str(e)})")
@@ -157,13 +215,22 @@ def diagnose():
         if not queried_models:
             return jsonify({"error": "No AI models were available to process your request. Please check API configurations.", "skipped_models": skipped_models}), 503
         
+        # Create fallback response if parsing failed
+        if not openrouter_response:
+            openrouter_response = {
+                "conditions": [{"name": "Unable to determine", "likelihood": 0, "explanation": "Response parsing failed"}],
+                "urgent": False,
+                "consult": "Please consult with a veterinarian for proper diagnosis.",
+                "homecare": "Monitor your pet and seek professional veterinary advice."
+            }
+        
         final_diagnosis = get_highest_ranked_diagnosis(results)
         response = {
             "diagnosis": final_diagnosis,
-            "conditions": openrouter_response["conditions"],
-            "urgent": openrouter_response["urgent"],
-            "consult": openrouter_response["consult"],
-            "homecare": openrouter_response["homecare"],
+            "conditions": openrouter_response.get("conditions", []),
+            "urgent": openrouter_response.get("urgent", False),
+            "consult": openrouter_response.get("consult", "Consult with a veterinarian"),
+            "homecare": openrouter_response.get("homecare", "Monitor your pet closely"),
             "disclaimer": "This is not professional veterinary advice. Please consult a licensed veterinarian for accurate diagnosis and treatment.",
             "queried_models": queried_models,
             "skipped_models": skipped_models
@@ -174,17 +241,21 @@ def diagnose():
         return jsonify({"error": str(e)}), 500
 
 def query_veterinary_details(diagnosis, species, breed):
-    prompt = f"""Provide a JSON object with detailed veterinary information about "{diagnosis}" in {species} (breed: {breed}) using Basic List of Veterinary Medical Serials, Third Edition. Include these fields:
-    - Overview (str)
-    - Symptoms (list or str)  
-    - When to see a veterinarian (str)
-    - Causes (str)
-    - Risk factors (list or str)
-    - Complications (str)
-    - Prevention (str)
-    - Treatment options (str)
-    Focus on species-specific and breed-specific considerations where relevant.
-    Return a valid JSON object, with no additional text or code blocks."""
+    prompt = f"""Provide detailed veterinary information about "{diagnosis}" in {species} (breed: {breed}).
+
+Please respond with ONLY a valid JSON object in this exact format:
+{{
+  "Overview": "Brief overview of the condition",
+  "Symptoms": ["symptom1", "symptom2", "symptom3"],
+  "When to see a veterinarian": "When to seek professional help",
+  "Causes": "What causes this condition",
+  "Risk factors": ["factor1", "factor2"],
+  "Complications": "Possible complications",
+  "Prevention": "Prevention methods",
+  "Treatment options": "Available treatments"
+}}
+
+Focus on species-specific and breed-specific considerations where relevant. Make sure the JSON is valid and complete."""
     
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -194,13 +265,14 @@ def query_veterinary_details(diagnosis, species, breed):
     data = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
         "temperature": 0.1,
         "max_tokens": 2000
     }
     response = requests.post(f"{OPENROUTER_BASE_URL}/chat/completions", headers=headers, json=data)
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    
+    content = response.json()["choices"][0]["message"]["content"]
+    return extract_json_from_response(content)
 
 @app.route('/veterinary-details', methods=['POST'])
 def veterinary_details():
@@ -220,8 +292,12 @@ def veterinary_details():
         
         if OPENROUTER_API_KEY:
             try:
-                details = json.loads(query_veterinary_details(diagnosis, species, breed))
-                queried_models.append("OpenRouter/Llama-3.3")
+                details = query_veterinary_details(diagnosis, species, breed)
+                if details:
+                    queried_models.append("OpenRouter/Llama-3.3")
+                else:
+                    details = None
+                    skipped_models.append("OpenRouter (parsing error)")
             except Exception as e:
                 logger.error(f"Error getting veterinary details: {str(e)}")
                 details = None
