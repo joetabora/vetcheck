@@ -1,0 +1,8 @@
+Flask
+gunicorn
+requests
+python-dotenv
+tenacity
+gevent
+typing_extensions
+openai
